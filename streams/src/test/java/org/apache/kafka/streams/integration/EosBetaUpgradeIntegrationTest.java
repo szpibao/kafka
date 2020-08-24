@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.streams.integration;
 
+import java.time.Duration;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Partitioner;
@@ -30,16 +31,22 @@ import org.apache.kafka.common.serialization.LongSerializer;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KafkaStreams.State;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StoreQueryParameters;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.StreamsConfig.InternalConfig;
 import org.apache.kafka.streams.integration.utils.EmbeddedKafkaCluster;
 import org.apache.kafka.streams.integration.utils.IntegrationTestUtils;
+import org.apache.kafka.streams.integration.utils.IntegrationTestUtils.StableAssignmentListener;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Transformer;
 import org.apache.kafka.streams.kstream.TransformerSupplier;
+import org.apache.kafka.streams.processor.Cancellable;
 import org.apache.kafka.streams.processor.ProcessorContext;
+import org.apache.kafka.streams.processor.PunctuationType;
+import org.apache.kafka.streams.processor.Punctuator;
 import org.apache.kafka.streams.processor.internals.DefaultKafkaClientSupplier;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.KeyValueStore;
@@ -76,6 +83,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static org.apache.kafka.common.utils.Utils.mkSet;
+import static org.apache.kafka.streams.integration.utils.IntegrationTestUtils.getStore;
 import static org.apache.kafka.test.TestUtils.waitForCondition;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -100,31 +108,6 @@ public class EosBetaUpgradeIntegrationTest {
     private static final int MAX_POLL_INTERVAL_MS = 100 * 1000;
     private static final int MAX_WAIT_TIME_MS = 60 * 1000;
 
-    private static final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> TWO_REBALANCES_STARTUP =
-        Collections.unmodifiableList(
-            Arrays.asList(
-                KeyValue.pair(KafkaStreams.State.CREATED, KafkaStreams.State.REBALANCING),
-                KeyValue.pair(KafkaStreams.State.REBALANCING, KafkaStreams.State.RUNNING),
-                KeyValue.pair(KafkaStreams.State.RUNNING, KafkaStreams.State.REBALANCING),
-                KeyValue.pair(KafkaStreams.State.REBALANCING, KafkaStreams.State.RUNNING)
-            )
-        );
-    private static final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> TWO_REBALANCES_RUNNING =
-        Collections.unmodifiableList(
-            Arrays.asList(
-                KeyValue.pair(KafkaStreams.State.RUNNING, KafkaStreams.State.REBALANCING),
-                KeyValue.pair(KafkaStreams.State.REBALANCING, KafkaStreams.State.RUNNING),
-                KeyValue.pair(KafkaStreams.State.RUNNING, KafkaStreams.State.REBALANCING),
-                KeyValue.pair(KafkaStreams.State.REBALANCING, KafkaStreams.State.RUNNING)
-            )
-        );
-    private static final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> SINGLE_REBALANCE =
-        Collections.unmodifiableList(
-            Arrays.asList(
-                KeyValue.pair(KafkaStreams.State.RUNNING, KafkaStreams.State.REBALANCING),
-                KeyValue.pair(KafkaStreams.State.REBALANCING, KafkaStreams.State.RUNNING)
-            )
-        );
     private static final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> CLOSE =
         Collections.unmodifiableList(
             Arrays.asList(
@@ -159,6 +142,8 @@ public class EosBetaUpgradeIntegrationTest {
     private final static String MULTI_PARTITION_OUTPUT_TOPIC = "multiPartitionOutputTopic";
     private final String storeName = "store";
 
+    private final StableAssignmentListener assignmentListener = new StableAssignmentListener();
+
     private final AtomicBoolean errorInjectedClient1 = new AtomicBoolean(false);
     private final AtomicBoolean errorInjectedClient2 = new AtomicBoolean(false);
     private final AtomicBoolean commitErrorInjectedClient1 = new AtomicBoolean(false);
@@ -166,6 +151,27 @@ public class EosBetaUpgradeIntegrationTest {
     private final AtomicInteger commitCounterClient1 = new AtomicInteger(-1);
     private final AtomicInteger commitCounterClient2 = new AtomicInteger(-1);
     private final AtomicInteger commitRequested = new AtomicInteger(0);
+
+    // Note: this pattern only works when we just have a single instance running with a single thread
+    // If we want to extend the test or reuse this CommitPunctuator we should tighten it up
+    private final AtomicBoolean requestCommit = new AtomicBoolean(false);
+    private static class CommitPunctuator implements Punctuator {
+        final ProcessorContext context;
+        final AtomicBoolean requestCommit;
+
+        public CommitPunctuator(final ProcessorContext context, final AtomicBoolean requestCommit) {
+            this.context = context;
+            this.requestCommit = requestCommit;
+        }
+
+        @Override
+        public void punctuate(final long timestamp) {
+            if (requestCommit.get()) {
+                context.commit();
+                requestCommit.set(false);
+            }
+        }
+    }
 
     private Throwable uncaughtException;
 
@@ -259,24 +265,25 @@ public class EosBetaUpgradeIntegrationTest {
             streams1Alpha.setStateListener(
                 (newState, oldState) -> stateTransitions1.add(KeyValue.pair(oldState, newState))
             );
+
+            assignmentListener.prepareForRebalance();
             streams1Alpha.cleanUp();
             streams1Alpha.start();
-            waitForStateTransition(
-                stateTransitions1,
-                Arrays.asList(
-                    KeyValue.pair(KafkaStreams.State.CREATED, KafkaStreams.State.REBALANCING),
-                    KeyValue.pair(KafkaStreams.State.REBALANCING, KafkaStreams.State.RUNNING)
-                )
-            );
+            assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+            waitForRunning(stateTransitions1);
 
-            stateTransitions1.clear();
             streams2Alpha = getKafkaStreams("appDir2", StreamsConfig.EXACTLY_ONCE);
             streams2Alpha.setStateListener(
                 (newState, oldState) -> stateTransitions2.add(KeyValue.pair(oldState, newState))
             );
+            stateTransitions1.clear();
+
+            assignmentListener.prepareForRebalance();
             streams2Alpha.cleanUp();
             streams2Alpha.start();
-            waitForStateTransition(stateTransitions1, TWO_REBALANCES_RUNNING, stateTransitions2, TWO_REBALANCES_STARTUP);
+            assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+            waitForRunning(stateTransitions1);
+            waitForRunning(stateTransitions2);
 
             // in all phases, we write comments that assume that p-0/p-1 are assigned to the first client
             // and p-2/p-3 are assigned to the second client (in reality the assignment might be different though)
@@ -363,6 +370,8 @@ public class EosBetaUpgradeIntegrationTest {
             //   p-2: 10 rec + C + 5 rec (pending)
             //   p-3: 10 rec + C + 5 rec (pending)
             stateTransitions2.clear();
+            assignmentListener.prepareForRebalance();
+
             if (!injectError) {
                 stateTransitions1.clear();
                 streams1Alpha.close();
@@ -375,7 +384,8 @@ public class EosBetaUpgradeIntegrationTest {
                 uncommittedInputDataBeforeFirstUpgrade.addAll(dataPotentiallyFirstFailingKey);
                 writeInputData(dataPotentiallyFirstFailingKey);
             }
-            waitForStateTransition(stateTransitions2, SINGLE_REBALANCE);
+            assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+            waitForRunning(stateTransitions2);
 
             if (!injectError) {
                 final List<KeyValue<Long, Long>> committedInputDataDuringFirstUpgrade =
@@ -417,13 +427,18 @@ public class EosBetaUpgradeIntegrationTest {
             //   p-1: 10 rec + C + 5 rec + A + 5 rec ---> C
             //   p-2: 10 rec + C + 5 rec ---> C
             //   p-3: 10 rec + C + 5 rec ---> C
+            requestCommit.set(true);
+            waitForCondition(() -> !requestCommit.get(), "Punctuator did not request commit for running client");
             commitRequested.set(0);
             stateTransitions1.clear();
             stateTransitions2.clear();
             streams1Beta = getKafkaStreams("appDir1", StreamsConfig.EXACTLY_ONCE_BETA);
             streams1Beta.setStateListener((newState, oldState) -> stateTransitions1.add(KeyValue.pair(oldState, newState)));
+            assignmentListener.prepareForRebalance();
             streams1Beta.start();
-            waitForStateTransition(stateTransitions1, TWO_REBALANCES_STARTUP, stateTransitions2, TWO_REBALANCES_RUNNING);
+            assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+            waitForRunning(stateTransitions1);
+            waitForRunning(stateTransitions2);
 
             final Set<Long> committedKeys = mkSet(0L, 1L, 2L, 3L);
             if (!injectError) {
@@ -495,6 +510,8 @@ public class EosBetaUpgradeIntegrationTest {
 
                 stateTransitions1.clear();
                 stateTransitions2.clear();
+                assignmentListener.prepareForRebalance();
+
                 commitCounterClient1.set(0);
                 commitErrorInjectedClient2.set(true);
 
@@ -507,7 +524,9 @@ public class EosBetaUpgradeIntegrationTest {
                 );
                 verifyUncommitted(expectedUncommittedResult);
 
-                waitForStateTransition(stateTransitions1, SINGLE_REBALANCE, stateTransitions2, CRASH);
+                assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+
+                waitForStateTransition(stateTransitions2, CRASH);
 
                 commitErrorInjectedClient2.set(false);
                 stateTransitions2.clear();
@@ -545,8 +564,11 @@ public class EosBetaUpgradeIntegrationTest {
                 streams2AlphaTwo.setStateListener(
                     (newState, oldState) -> stateTransitions2.add(KeyValue.pair(oldState, newState))
                 );
+                assignmentListener.prepareForRebalance();
                 streams2AlphaTwo.start();
-                waitForStateTransition(stateTransitions1, TWO_REBALANCES_RUNNING, stateTransitions2, TWO_REBALANCES_STARTUP);
+                assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+                waitForRunning(stateTransitions1);
+                waitForRunning(stateTransitions2);
 
                 // 7b. write third batch of input data
                 final Set<Long> keysFirstClient = keysFromInstance(streams1Beta);
@@ -580,6 +602,7 @@ public class EosBetaUpgradeIntegrationTest {
 
                 stateTransitions1.clear();
                 stateTransitions2.clear();
+                assignmentListener.prepareForRebalance();
                 commitCounterClient2.set(0);
                 commitErrorInjectedClient1.set(true);
 
@@ -592,7 +615,8 @@ public class EosBetaUpgradeIntegrationTest {
                 );
                 verifyUncommitted(expectedUncommittedResult);
 
-                waitForStateTransition(stateTransitions1, CRASH, stateTransitions2, SINGLE_REBALANCE);
+                assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+                waitForStateTransition(stateTransitions1, CRASH);
 
                 commitErrorInjectedClient1.set(false);
                 stateTransitions1.clear();
@@ -609,8 +633,11 @@ public class EosBetaUpgradeIntegrationTest {
                 stateTransitions2.clear();
                 streams1BetaTwo = getKafkaStreams("appDir1", StreamsConfig.EXACTLY_ONCE_BETA);
                 streams1BetaTwo.setStateListener((newState, oldState) -> stateTransitions1.add(KeyValue.pair(oldState, newState)));
+                assignmentListener.prepareForRebalance();
                 streams1BetaTwo.start();
-                waitForStateTransition(stateTransitions1, TWO_REBALANCES_STARTUP, stateTransitions2, TWO_REBALANCES_RUNNING);
+                assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+                waitForRunning(stateTransitions1);
+                waitForRunning(stateTransitions2);
             }
 
             // phase 8: (write partial fourth batch of data)
@@ -673,6 +700,7 @@ public class EosBetaUpgradeIntegrationTest {
             //   p-2: 10 rec + C + 5 rec + C + 5 rec + A + 5 rec + C + 10 rec + C + 4 rec ---> A + 5 rec (pending)
             //   p-3: 10 rec + C + 5 rec + C + 5 rec + A + 5 rec + C + 10 rec + C + 5 rec ---> A + 5 rec (pending)
             stateTransitions1.clear();
+            assignmentListener.prepareForRebalance();
             if (!injectError) {
                 stateTransitions2.clear();
                 streams2AlphaTwo.close();
@@ -685,7 +713,8 @@ public class EosBetaUpgradeIntegrationTest {
                 uncommittedInputDataBeforeSecondUpgrade.addAll(dataPotentiallySecondFailingKey);
                 writeInputData(dataPotentiallySecondFailingKey);
             }
-            waitForStateTransition(stateTransitions1, SINGLE_REBALANCE);
+            assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+            waitForRunning(stateTransitions1);
 
             if (!injectError) {
                 final List<KeyValue<Long, Long>> committedInputDataDuringSecondUpgrade =
@@ -730,6 +759,8 @@ public class EosBetaUpgradeIntegrationTest {
             //   p-1: 10 rec + C + 5 rec + A + 5 rec + C + 5 rec + C + 10 rec + A + 10 rec + C + 5 rec ---> C
             //   p-2: 10 rec + C + 5 rec + C + 5 rec + A + 5 rec + C + 10 rec + C + 4 rec + A + 5 rec ---> C
             //   p-3: 10 rec + C + 5 rec + C + 5 rec + A + 5 rec + C + 10 rec + C + 5 rec + A + 5 rec ---> C
+            requestCommit.set(true);
+            waitForCondition(() -> !requestCommit.get(), "Punctuator did not request commit for running client");
             commitRequested.set(0);
             stateTransitions1.clear();
             stateTransitions2.clear();
@@ -737,8 +768,11 @@ public class EosBetaUpgradeIntegrationTest {
             streams2Beta.setStateListener(
                 (newState, oldState) -> stateTransitions2.add(KeyValue.pair(oldState, newState))
             );
+            assignmentListener.prepareForRebalance();
             streams2Beta.start();
-            waitForStateTransition(stateTransitions1, TWO_REBALANCES_RUNNING, stateTransitions2, TWO_REBALANCES_STARTUP);
+            assignmentListener.waitForNextStableAssignment(MAX_WAIT_TIME_MS);
+            waitForRunning(stateTransitions1);
+            waitForRunning(stateTransitions2);
 
             committedKeys.addAll(mkSet(0L, 1L, 2L, 3L));
             if (!injectError) {
@@ -820,6 +854,7 @@ public class EosBetaUpgradeIntegrationTest {
                     KeyValueStore<Long, Long> state = null;
                     AtomicBoolean crash;
                     AtomicInteger sharedCommit;
+                    Cancellable punctuator;
 
                     @Override
                     public void init(final ProcessorContext context) {
@@ -833,6 +868,11 @@ public class EosBetaUpgradeIntegrationTest {
                             crash = errorInjectedClient2;
                             sharedCommit = commitCounterClient2;
                         }
+                        punctuator = context.schedule(
+                            Duration.ofMillis(100),
+                            PunctuationType.WALL_CLOCK_TIME,
+                            new CommitPunctuator(context, requestCommit)
+                        );
                     }
 
                     @Override
@@ -865,7 +905,9 @@ public class EosBetaUpgradeIntegrationTest {
                     }
 
                     @Override
-                    public void close() { }
+                    public void close() {
+                        punctuator.cancel();
+                    }
                 };
             } }, storeNames)
             .to(MULTI_PARTITION_OUTPUT_TOPIC);
@@ -882,6 +924,7 @@ public class EosBetaUpgradeIntegrationTest {
         properties.put(StreamsConfig.producerPrefix(ProducerConfig.PARTITIONER_CLASS_CONFIG), KeyPartitioner.class);
         properties.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 0);
         properties.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getPath() + File.separator + appDir);
+        properties.put(InternalConfig.ASSIGNMENT_LISTENER, assignmentListener);
 
         final Properties config = StreamsTestUtils.getStreamsConfig(
             applicationId,
@@ -904,6 +947,14 @@ public class EosBetaUpgradeIntegrationTest {
         return streams;
     }
 
+    private void waitForRunning(final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> observed) throws Exception {
+        waitForCondition(
+            () -> !observed.isEmpty() && observed.get(observed.size() - 1).value.equals(State.RUNNING),
+            MAX_WAIT_TIME_MS,
+            () -> "Client did not startup on time. Observers transitions: " + observed
+        );
+    }
+
     private void waitForStateTransition(final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> observed,
                                         final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> expected)
             throws Exception {
@@ -912,21 +963,6 @@ public class EosBetaUpgradeIntegrationTest {
             () -> observed.equals(expected),
             MAX_WAIT_TIME_MS,
             () -> "Client did not startup on time. Observers transitions: " + observed
-        );
-    }
-
-    private void waitForStateTransition(final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> observed1,
-                                        final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> expected1,
-                                        final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> observed2,
-                                        final List<KeyValue<KafkaStreams.State, KafkaStreams.State>> expected2)
-            throws Exception {
-
-        waitForCondition(
-            () -> observed1.equals(expected1) && observed2.equals(expected2),
-            MAX_WAIT_TIME_MS,
-            () -> "Clients did not startup and stabilize on time. Observed transitions: " +
-                "\n  client-1 transitions: " + observed1 +
-                "\n  client-2 transitions: " + observed2
         );
     }
 
@@ -1038,9 +1074,12 @@ public class EosBetaUpgradeIntegrationTest {
         return expectedResult;
     }
 
-    private Set<Long> keysFromInstance(final KafkaStreams streams) {
-        final ReadOnlyKeyValueStore<Long, Long> store =
-            streams.store(StoreQueryParameters.fromNameAndType(storeName, QueryableStoreTypes.keyValueStore()));
+    private Set<Long> keysFromInstance(final KafkaStreams streams) throws Exception {
+        final ReadOnlyKeyValueStore<Long, Long> store = getStore(
+            MAX_WAIT_TIME_MS,
+            streams,
+            StoreQueryParameters.fromNameAndType(storeName, QueryableStoreTypes.keyValueStore())
+        );
         final Set<Long> keys = new HashSet<>();
         try (final KeyValueIterator<Long, Long> it = store.all()) {
             while (it.hasNext()) {

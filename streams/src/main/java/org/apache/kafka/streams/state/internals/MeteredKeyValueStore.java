@@ -24,6 +24,7 @@ import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.errors.ProcessorStateException;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
 import org.apache.kafka.streams.processor.internals.ProcessorStateManager;
 import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 import org.apache.kafka.streams.state.KeyValueIterator;
@@ -41,6 +42,7 @@ import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetric
  * inner KeyValueStore implementation do not need to provide its own metrics collecting functionality.
  * The inner {@link KeyValueStore} of this class is of type &lt;Bytes,byte[]&gt;, hence we use {@link Serde}s
  * to convert from &lt;K,V&gt; to &lt;Bytes,byte[]&gt;
+ *
  * @param <K>
  * @param <V>
  */
@@ -54,9 +56,9 @@ public class MeteredKeyValueStore<K, V>
 
     private final String metricsScope;
     protected final Time time;
-    private Sensor putSensor;
+    protected Sensor putSensor;
     private Sensor putIfAbsentSensor;
-    private Sensor getSensor;
+    protected Sensor getSensor;
     private Sensor deleteSensor;
     private Sensor putAllSensor;
     private Sensor allSensor;
@@ -103,8 +105,12 @@ public class MeteredKeyValueStore<K, V>
 
     @SuppressWarnings("unchecked")
     void initStoreSerde(final ProcessorContext context) {
+        final String storeName = name();
+        final String changelogTopic = ProcessorContextUtils.changelogFor(context, storeName);
         serdes = new StateSerdes<>(
-            ProcessorStateManager.storeChangelogTopic(context.applicationId(), name()),
+             changelogTopic != null ?
+                changelogTopic :
+                ProcessorStateManager.storeChangelogTopic(context.applicationId(), storeName),
             keySerde == null ? (Serde<K>) context.keySerde() : keySerde,
             valueSerde == null ? (Serde<V>) context.valueSerde() : valueSerde);
     }
@@ -183,8 +189,22 @@ public class MeteredKeyValueStore<K, V>
     }
 
     @Override
+    public KeyValueIterator<K, V> reverseRange(final K from,
+                                               final K to) {
+        return new MeteredKeyValueIterator(
+            wrapped().reverseRange(Bytes.wrap(serdes.rawKey(from)), Bytes.wrap(serdes.rawKey(to))),
+            rangeSensor
+        );
+    }
+
+    @Override
     public KeyValueIterator<K, V> all() {
         return new MeteredKeyValueIterator(wrapped().all(), allSensor);
+    }
+
+    @Override
+    public KeyValueIterator<K, V> reverseAll() {
+        return new MeteredKeyValueIterator(wrapped().reverseAll(), allSensor);
     }
 
     @Override
@@ -206,11 +226,11 @@ public class MeteredKeyValueStore<K, V>
         }
     }
 
-    private V outerValue(final byte[] value) {
+    protected V outerValue(final byte[] value) {
         return value != null ? serdes.valueFrom(value) : null;
     }
 
-    private Bytes keyBytes(final K key) {
+    protected Bytes keyBytes(final K key) {
         return Bytes.wrap(serdes.rawKey(key));
     }
 

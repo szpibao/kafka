@@ -205,7 +205,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     }
 
     def verifySslConfig(prefix: String, expectedProps: Properties, configDesc: Config): Unit = {
-      KEYSTORE_PROPS.asScala.foreach { configName =>
+      KEYSTORE_PROPS.forEach { configName =>
         val desc = configEntry(configDesc, s"$prefix$configName")
         val isSensitive = configName.contains("password")
         verifyConfig(configName, desc, isSensitive, isReadOnly = prefix.nonEmpty, if (prefix.isEmpty) invalidSslProperties else sslProperties1)
@@ -521,7 +521,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     reconfigureServers(props, perBrokerConfig = false, (KafkaConfig.MinInSyncReplicasProp, "3"))
     // Verify that all broker defaults have been updated again
     servers.foreach { server =>
-      props.asScala.foreach { case (k, v) =>
+      props.forEach { (k, v) =>
         assertEquals(s"Not reconfigured $k", v, server.config.originals.get(k).toString)
       }
     }
@@ -570,7 +570,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
 
     // Verify that all broker defaults have been updated
     servers.foreach { server =>
-      props.asScala.foreach { case (k, v) =>
+      props.forEach { (k, v) =>
         assertEquals(s"Not reconfigured $k", server.config.originals.get(k).toString, v)
       }
     }
@@ -622,12 +622,34 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     // configuration across brokers, they can also be defined at per-broker level for testing
     props.clear()
     props.put(KafkaConfig.LogIndexSizeMaxBytesProp, "500000")
+    props.put(KafkaConfig.LogRetentionTimeMillisProp, TimeUnit.DAYS.toMillis(2).toString)
     alterConfigsOnServer(servers.head, props)
     assertEquals(500000, servers.head.config.values.get(KafkaConfig.LogIndexSizeMaxBytesProp))
-    servers.tail.foreach { server => assertEquals(Defaults.LogIndexSizeMaxBytes, server.config.values.get(KafkaConfig.LogIndexSizeMaxBytesProp)) }
+    assertEquals(TimeUnit.DAYS.toMillis(2), servers.head.config.values.get(KafkaConfig.LogRetentionTimeMillisProp))
+    servers.tail.foreach { server =>
+      assertEquals(Defaults.LogIndexSizeMaxBytes, server.config.values.get(KafkaConfig.LogIndexSizeMaxBytesProp))
+      assertEquals(1680000000L, server.config.values.get(KafkaConfig.LogRetentionTimeMillisProp))
+    }
 
     // Verify that produce/consume worked throughout this test without any retries in producer
     stopAndVerifyProduceConsume(producerThread, consumerThread)
+
+    // Verify that configuration at both per-broker level and default cluster level could be deleted and
+    // the default value should be restored
+    props.clear()
+    props.put(KafkaConfig.LogRetentionTimeMillisProp, "")
+    props.put(KafkaConfig.LogIndexSizeMaxBytesProp, "")
+    TestUtils.incrementalAlterConfigs(servers.take(1), adminClients.head, props, perBrokerConfig = true, opType = OpType.DELETE).all.get
+    TestUtils.incrementalAlterConfigs(servers, adminClients.head, props, perBrokerConfig = false, opType = OpType.DELETE).all.get
+    servers.foreach { server =>
+      waitForConfigOnServer(server, KafkaConfig.LogRetentionTimeMillisProp, 1680000000.toString)
+    }
+    servers.foreach { server =>
+      val log = server.logManager.getLog(new TopicPartition(topic, 0)).getOrElse(throw new IllegalStateException("Log not found"))
+      // Verify default values for these two configurations are restored on all brokers
+      TestUtils.waitUntilTrue(() => log.config.maxIndexSize == Defaults.LogIndexSizeMaxBytes && log.config.retentionMs == 1680000000L,
+        "Existing topic config using defaults not updated")
+    }
   }
 
   @Test
@@ -1204,7 +1226,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
 
   private def awaitInitialPositions(consumer: KafkaConsumer[_, _]): Unit = {
     TestUtils.pollUntilTrue(consumer, () => !consumer.assignment.isEmpty, "Timed out while waiting for assignment")
-    consumer.assignment.asScala.foreach(consumer.position)
+    consumer.assignment.forEach(consumer.position(_))
   }
 
   private def clientProps(securityProtocol: SecurityProtocol, saslMechanism: Option[String] = None): Properties = {
@@ -1576,7 +1598,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     val propsFile = TestUtils.tempFile()
     val propsWriter = new FileWriter(propsFile)
     try {
-      clientProps(SecurityProtocol.SSL).asScala.foreach {
+      clientProps(SecurityProtocol.SSL).forEach {
         case (k, v) => propsWriter.write(s"$k=$v\n")
       }
     } finally {
@@ -1633,6 +1655,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     def requestTimeoutMs(timeoutMs: Int): ProducerBuilder = { _requestTimeoutMs = timeoutMs; this }
     def deliveryTimeoutMs(timeoutMs: Int): ProducerBuilder = { _deliveryTimeoutMs= timeoutMs; this }
 
+    @nowarn("cat=deprecation")
     override def build(): KafkaProducer[String, String] = {
       val producerProps = propsOverride
       producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers)
@@ -1711,7 +1734,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
           received += records.count
           if (!records.isEmpty) {
             lastBatch = records
-            records.partitions.asScala.foreach { tp =>
+            records.partitions.forEach { tp =>
               val partition = tp.partition
               records.records(tp).asScala.map(_.key.toInt).foreach { key =>
                 val prevKey = lastReceived.asScala.getOrElse(partition, partition - numPartitions)

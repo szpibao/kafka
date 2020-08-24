@@ -16,22 +16,28 @@
  */
 package org.apache.kafka.streams;
 
+import java.util.NoSuchElementException;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.LongDeserializer;
 import org.apache.kafka.common.serialization.LongSerializer;
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.utils.SystemTime;
 import org.apache.kafka.streams.errors.TopologyException;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.kstream.Named;
 import org.apache.kafka.streams.processor.AbstractProcessor;
 import org.apache.kafka.streams.processor.Processor;
 import org.apache.kafka.streams.processor.ProcessorContext;
@@ -68,15 +74,15 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
 import static org.apache.kafka.common.utils.Utils.mkEntry;
 import static org.apache.kafka.common.utils.Utils.mkMap;
 import static org.apache.kafka.common.utils.Utils.mkProperties;
-import static org.hamcrest.CoreMatchers.endsWith;
+import static org.apache.kafka.common.utils.Utils.mkSet;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.hasItem;
-import static org.hamcrest.CoreMatchers.hasItems;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -391,15 +397,18 @@ public class TopologyTestDriverTest {
         return topology;
     }
 
-    private Topology setupTopologyWithInternalTopic() {
+    private Topology setupTopologyWithInternalTopic(final String firstTableName,
+                                                    final String secondTableName,
+                                                    final String joinName) {
         final StreamsBuilder builder = new StreamsBuilder();
 
-        builder.stream(SOURCE_TOPIC_1)
+        final KTable<Object, Long> t1 = builder.stream(SOURCE_TOPIC_1)
             .selectKey((k, v) -> v)
             .groupByKey()
-            .count()
-            .toStream()
-            .to(SINK_TOPIC_1);
+            .count(Materialized.as(firstTableName));
+
+        builder.table(SOURCE_TOPIC_2, Materialized.as(secondTableName))
+            .join(t1, v -> v, (v1, v2) -> v2, Named.as(joinName));
 
         return builder.build(config);
     }
@@ -467,23 +476,76 @@ public class TopologyTestDriverTest {
     }
 
     @Test
-    public void shouldGetSinkTopicNames() {
+    public void shouldThrowNoSuchElementExceptionForUnusedOutputTopicWithDynamicRouting() {
+        testDriver = new TopologyTestDriver(setupSourceSinkTopology(), config);
+        final TestOutputTopic<String, String> outputTopic = new TestOutputTopic<>(
+            testDriver,
+            "unused-topic",
+            new StringDeserializer(),
+            new StringDeserializer()
+        );
+
+        assertTrue(outputTopic.isEmpty());
+        assertThrows(NoSuchElementException.class, outputTopic::readRecord);
+    }
+
+    @Test
+    public void shouldCaptureSinkTopicNamesIfWrittenInto() {
         testDriver = new TopologyTestDriver(setupSourceSinkTopology(), config);
 
-        pipeRecord(SOURCE_TOPIC_1, testRecord1);
+        assertThat(testDriver.producedTopicNames(), is(Collections.emptySet()));
 
+        pipeRecord(SOURCE_TOPIC_1, testRecord1);
         assertThat(testDriver.producedTopicNames(), hasItem(SINK_TOPIC_1));
     }
 
     @Test
-    public void shouldGetInternalTopicNames() {
-        testDriver = new TopologyTestDriver(setupTopologyWithInternalTopic(), config);
+    public void shouldCaptureInternalTopicNamesIfWrittenInto() {
+        testDriver = new TopologyTestDriver(
+            setupTopologyWithInternalTopic("table1", "table2", "join"),
+            config
+        );
+
+        assertThat(testDriver.producedTopicNames(), is(Collections.emptySet()));
 
         pipeRecord(SOURCE_TOPIC_1, testRecord1);
+        assertThat(
+            testDriver.producedTopicNames(),
+            equalTo(mkSet(
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-table1-repartition",
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-table1-changelog"
+            ))
+        );
 
-        assertThat(testDriver.producedTopicNames(), hasItems(
-            endsWith("-changelog"), endsWith("-repartition")
-        ));
+        pipeRecord(SOURCE_TOPIC_2, testRecord1);
+        assertThat(
+            testDriver.producedTopicNames(),
+            equalTo(mkSet(
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-table1-repartition",
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-table1-changelog",
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-table2-changelog",
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-join-subscription-registration-topic",
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-join-subscription-store-changelog",
+                config.getProperty(StreamsConfig.APPLICATION_ID_CONFIG) + "-join-subscription-response-topic"
+            ))
+        );
+    }
+
+    @Test
+    public void shouldCaptureGlobalTopicNameIfWrittenInto() {
+        final StreamsBuilder builder = new StreamsBuilder();
+        builder.globalTable(SOURCE_TOPIC_1, Materialized.as("globalTable"));
+        builder.stream(SOURCE_TOPIC_2).to(SOURCE_TOPIC_1);
+
+        testDriver = new TopologyTestDriver(builder.build(), config);
+
+        assertThat(testDriver.producedTopicNames(), is(Collections.emptySet()));
+
+        pipeRecord(SOURCE_TOPIC_2, testRecord1);
+        assertThat(
+            testDriver.producedTopicNames(),
+            equalTo(Collections.singleton(SOURCE_TOPIC_1))
+        );
     }
 
     @Test
@@ -666,6 +728,56 @@ public class TopologyTestDriverTest {
             testDriver.readRecord(SINK_TOPIC_1, Serdes.Integer().deserializer(), Serdes.Double().deserializer());
         assertThat(result2.getKey(), equalTo(source2Key));
         assertThat(result2.getValue(), equalTo(source2Value));
+    }
+
+    @Test
+    public void shouldPassRecordHeadersIntoSerializersAndDeserializers() {
+        testDriver = new TopologyTestDriver(setupSourceSinkTopology(), config);
+
+        final AtomicBoolean passedHeadersToKeySerializer = new AtomicBoolean(false);
+        final AtomicBoolean passedHeadersToValueSerializer = new AtomicBoolean(false);
+        final AtomicBoolean passedHeadersToKeyDeserializer = new AtomicBoolean(false);
+        final AtomicBoolean passedHeadersToValueDeserializer = new AtomicBoolean(false);
+
+        final Serializer<byte[]> keySerializer = new ByteArraySerializer() {
+            @Override
+            public byte[] serialize(final String topic, final Headers headers, final byte[] data) {
+                passedHeadersToKeySerializer.set(true);
+                return serialize(topic, data);
+            }
+        };
+        final Serializer<byte[]> valueSerializer = new ByteArraySerializer() {
+            @Override
+            public byte[] serialize(final String topic, final Headers headers, final byte[] data) {
+                passedHeadersToValueSerializer.set(true);
+                return serialize(topic, data);
+            }
+        };
+
+        final Deserializer<byte[]> keyDeserializer = new ByteArrayDeserializer() {
+            @Override
+            public byte[] deserialize(final String topic, final Headers headers, final byte[] data) {
+                passedHeadersToKeyDeserializer.set(true);
+                return deserialize(topic, data);
+            }
+        };
+        final Deserializer<byte[]> valueDeserializer = new ByteArrayDeserializer() {
+            @Override
+            public byte[] deserialize(final String topic, final Headers headers, final byte[] data) {
+                passedHeadersToValueDeserializer.set(true);
+                return deserialize(topic, data);
+            }
+        };
+
+        final TestInputTopic<byte[], byte[]> inputTopic = testDriver.createInputTopic(SOURCE_TOPIC_1, keySerializer, valueSerializer);
+        final TestOutputTopic<byte[], byte[]> outputTopic = testDriver.createOutputTopic(SINK_TOPIC_1, keyDeserializer, valueDeserializer);
+        inputTopic.pipeInput(testRecord1);
+        outputTopic.readRecord();
+
+        assertThat(passedHeadersToKeySerializer.get(), equalTo(true));
+        assertThat(passedHeadersToValueSerializer.get(), equalTo(true));
+        assertThat(passedHeadersToKeyDeserializer.get(), equalTo(true));
+        assertThat(passedHeadersToValueDeserializer.get(), equalTo(true));
     }
 
     @Test

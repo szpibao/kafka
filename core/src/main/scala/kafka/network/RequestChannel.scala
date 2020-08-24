@@ -139,11 +139,11 @@ object RequestChannel extends Logging {
 
         case alterConfigs: IncrementalAlterConfigsRequest =>
           val resources = new AlterConfigsResourceCollection(alterConfigs.data.resources.size)
-          alterConfigs.data().resources().asScala.foreach { resource =>
+          alterConfigs.data.resources.forEach { resource =>
             val newResource = new AlterConfigsResource()
               .setResourceName(resource.resourceName)
               .setResourceType(resource.resourceType)
-            resource.configs.asScala.foreach { config =>
+            resource.configs.forEach { config =>
               newResource.configs.add(new AlterableConfig()
                 .setName(config.name)
                 .setValue(loggableValue(ConfigResource.Type.forId(resource.resourceType), config.name, config.value))
@@ -309,7 +309,9 @@ object RequestChannel extends Logging {
   }
 }
 
-class RequestChannel(val queueSize: Int, val metricNamePrefix : String, time: Time) extends KafkaMetricsGroup {
+class RequestChannel(val queueSize: Int,
+                     val metricNamePrefix : String,
+                     time: Time) extends KafkaMetricsGroup {
   import RequestChannel._
   val metrics = new RequestChannel.Metrics
   private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
